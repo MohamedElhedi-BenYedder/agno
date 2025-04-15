@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Union, cast
 try:
     from sqlalchemy.dialects import postgresql
     from sqlalchemy.engine import Engine, create_engine
+    from sqlalchemy.ext.asyncio import create_async_engine , AsyncEngine, async_scoped_session, async_sessionmaker, AsyncSession
     from sqlalchemy.inspection import inspect
     from sqlalchemy.orm import Session, scoped_session, sessionmaker
     from sqlalchemy.schema import Column, Index, MetaData, Table
@@ -17,6 +18,11 @@ try:
     from pgvector.sqlalchemy import Vector
 except ImportError:
     raise ImportError("`pgvector` not installed. Please install using `pip install pgvector`")
+
+try:
+    from pydantic_core import MultiHostUrl
+except ImportError:
+    raise ImportError("`pydantic_core` not installed. Please install using `pip install pydantic_core`")
 
 from agno.document import Document
 from agno.embedder import Embedder
@@ -42,6 +48,7 @@ class PgVector(VectorDb):
         schema: str = "ai",
         db_url: Optional[str] = None,
         db_engine: Optional[Engine] = None,
+        async_engine: Optional[AsyncEngine] = None,
         embedder: Optional[Embedder] = None,
         search_type: SearchType = SearchType.vector,
         vector_index: Union[Ivfflat, HNSW] = HNSW(),
@@ -74,23 +81,42 @@ class PgVector(VectorDb):
         if not table_name:
             raise ValueError("Table name must be provided.")
 
-        if db_engine is None and db_url is None:
-            raise ValueError("Either 'db_url' or 'db_engine' must be provided.")
+        url = db_url or async_engine.url if async_engine else None or db_engine.url if db_engine else None
+        if url is None:
+            raise ValueError("Either 'db_url' or 'db_engine' or 'async_engine' must be provided.")
 
+        
+        multi_host_url = MultiHostUrl(url)
+        
         if db_engine is None:
-            if db_url is None:
-                raise ValueError("Must provide 'db_url' if 'db_engine' is None.")
             try:
-                db_engine = create_engine(db_url)
+                sync_db_url = MultiHostUrl.build(
+                scheme="postgresql+psycopg",
+                path=multi_host_url.path,
+                query=multi_host_url.query,
+                fragment=multi_host_url.fragment,
+            )
+                self.db_engine = create_engine(sync_db_url)
             except Exception as e:
                 logger.error(f"Failed to create engine from 'db_url': {e}")
                 raise
-
-        # Database settings
+            
+        if async_engine is None:
+            try:
+                async_db_url = MultiHostUrl.build(
+                scheme="postgresql+asyncpg",
+                path=multi_host_url.path,
+                query=multi_host_url.query,
+                fragment=multi_host_url.fragment,
+            )
+                self.async_engine = create_async_engine(async_db_url)
+            except Exception as e:
+                logger.error(f"Failed to create engine from 'db_url': {e}")
+                raise 
+        # Database settings 
         self.table_name: str = table_name
         self.schema: str = schema
         self.db_url: Optional[str] = db_url
-        self.db_engine: Engine = db_engine
         self.metadata: MetaData = MetaData(schema=self.schema)
 
         # Embedder for embedding the document contents
@@ -128,6 +154,7 @@ class PgVector(VectorDb):
 
         # Database session
         self.Session: scoped_session = scoped_session(sessionmaker(bind=self.db_engine))
+        self.AsyncSession: async_scoped_session = async_scoped_session(async_sessionmaker(bind=self.async_engine))
         # Database table
         self.table: Table = self.get_table()
         log_debug(f"Initialized PgVector with table '{self.schema}.{self.table_name}'")
@@ -1026,27 +1053,563 @@ class PgVector(VectorDb):
         return copied_obj
 
     async def async_create(self) -> None:
-        raise NotImplementedError(f"Async not supported on {self.__class__.__name__}.")
+        """
+        Create the table if it does not exist asynchronously.
+        """
+        if not await self.async_table_exists():
+            async with self.AsyncSession() as async_sess:
+                async with async_sess.begin():
+                    log_debug("Creating extension: vector")
+                    await async_sess.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
+                    if self.schema is not None:
+                        log_debug(f"Creating schema: {self.schema}")
+                        await async_sess.execute(text(f"CREATE SCHEMA IF NOT EXISTS {self.schema};"))
+            log_debug(f"Creating table: {self.table_name}")
+            async with self.AsyncSession() as async_sess:
+                async with async_sess.begin():
+                    await async_sess.run_sync(self.table.create)
 
     async def async_doc_exists(self, document: Document) -> bool:
-        raise NotImplementedError(f"Async not supported on {self.__class__.__name__}.")
+        """
+        Check if a document with the same content hash exists in the table asynchronously.
 
-    async def async_insert(self, documents: List[Document], filters: Optional[Dict[str, Any]] = None) -> None:
-        raise NotImplementedError(f"Async not supported on {self.__class__.__name__}.")
+        Args:
+            document (Document): The document to check.
 
-    async def async_upsert(self, documents: List[Document], filters: Optional[Dict[str, Any]] = None) -> None:
-        raise NotImplementedError(f"Async not supported on {self.__class__.__name__}.")
+        Returns:
+            bool: True if the document exists, False otherwise.
+        """
+        cleaned_content = document.content.replace("\x00", "\ufffd")
+        content_hash = md5(cleaned_content.encode()).hexdigest()
+        return await self._async_record_exists(self.table.c.content_hash, content_hash)
+
+    async def async_insert(
+        self,
+        documents: List[Document],
+        filters: Optional[Dict[str, Any]] = None,
+        batch_size: int = 100,
+    ) -> None:
+        """
+        Insert documents into the database asynchronously.
+
+        Args:
+            documents (List[Document]): List of documents to insert.
+            filters (Optional[Dict[str, Any]]): Filters to apply to the documents.
+            batch_size (int): Number of documents to insert in each batch.
+        """
+        try:
+            async with self.AsyncSession() as async_sess:
+                for i in range(0, len(documents), batch_size):
+                    batch_docs = documents[i : i + batch_size]
+                    log_debug(f"Processing batch starting at index {i}, size: {len(batch_docs)}")
+                    try:
+                        # Prepare documents for insertion
+                        batch_records = []
+                        for doc in batch_docs:
+                            try:
+                                doc.embed(embedder=self.embedder)
+                                cleaned_content = self._clean_content(doc.content)
+                                content_hash = md5(cleaned_content.encode()).hexdigest()
+                                _id = doc.id or content_hash
+                                record = {
+                                    "id": _id,
+                                    "name": doc.name,
+                                    "meta_data": doc.meta_data,
+                                    "filters": filters,
+                                    "content": cleaned_content,
+                                    "embedding": doc.embedding,
+                                    "usage": doc.usage,
+                                    "content_hash": content_hash,
+                                }
+                                batch_records.append(record)
+                            except Exception as e:
+                                logger.error(f"Error processing document '{doc.name}': {e}")
+
+                        # Insert the batch of records
+                        async with async_sess.begin():
+                            insert_stmt = postgresql.insert(self.table)
+                            await async_sess.execute(insert_stmt, batch_records)
+                            log_info(f"Inserted batch of {len(batch_records)} documents.")
+                    except Exception as e:
+                        logger.error(f"Error with batch starting at index {i}: {e}")
+                        raise
+        except Exception as e:
+            logger.error(f"Error inserting documents: {e}")
+            raise
+
+    async def async_upsert(
+        self,
+        documents: List[Document],
+        filters: Optional[Dict[str, Any]] = None,
+        batch_size: int = 100,
+    ) -> None:
+        """
+        Upsert (insert or update) documents in the database asynchronously.
+
+        Args:
+            documents (List[Document]): List of documents to upsert.
+            filters (Optional[Dict[str, Any]]): Filters to apply to the documents.
+            batch_size (int): Number of documents to upsert in each batch.
+        """
+        try:
+            async with self.AsyncSession() as async_sess:
+                for i in range(0, len(documents), batch_size):
+                    batch_docs = documents[i : i + batch_size]
+                    log_debug(f"Processing batch starting at index {i}, size: {len(batch_docs)}")
+                    try:
+                        # Prepare documents for upserting
+                        batch_records = []
+                        for doc in batch_docs:
+                            try:
+                                doc.embed(embedder=self.embedder)
+                                cleaned_content = self._clean_content(doc.content)
+                                content_hash = md5(cleaned_content.encode()).hexdigest()
+                                _id = doc.id or content_hash
+                                record = {
+                                    "id": _id,
+                                    "name": doc.name,
+                                    "meta_data": doc.meta_data,
+                                    "filters": filters,
+                                    "content": cleaned_content,
+                                    "embedding": doc.embedding,
+                                    "usage": doc.usage,
+                                    "content_hash": content_hash,
+                                }
+                                batch_records.append(record)
+                            except Exception as e:
+                                logger.error(f"Error processing document '{doc.name}': {e}")
+
+                        # Upsert the batch of records
+                        async with async_sess.begin():
+                            insert_stmt = postgresql.insert(self.table).values(batch_records)
+                            upsert_stmt = insert_stmt.on_conflict_do_update(
+                                index_elements=["id"],
+                                set_=dict(
+                                    name=insert_stmt.excluded.name,
+                                    meta_data=insert_stmt.excluded.meta_data,
+                                    filters=insert_stmt.excluded.filters,
+                                    content=insert_stmt.excluded.content,
+                                    embedding=insert_stmt.excluded.embedding,
+                                    usage=insert_stmt.excluded.usage,
+                                    content_hash=insert_stmt.excluded.content_hash,
+                                ),
+                            )
+                            await async_sess.execute(upsert_stmt)
+                            log_info(f"Upserted batch of {len(batch_records)} documents.")
+                    except Exception as e:
+                        logger.error(f"Error with batch starting at index {i}: {e}")
+                        raise
+        except Exception as e:
+            logger.error(f"Error upserting documents: {e}")
+            raise
 
     async def async_search(
         self, query: str, limit: int = 5, filters: Optional[Dict[str, Any]] = None
     ) -> List[Document]:
-        raise NotImplementedError(f"Async not supported on {self.__class__.__name__}.")
+        """
+        Perform a search based on the configured search type asynchronously.
+
+        Args:
+            query (str): The search query.
+            limit (int): Maximum number of results to return.
+            filters (Optional[Dict[str, Any]]): Filters to apply to the search.
+
+        Returns:
+            List[Document]: List of matching documents.
+        """
+        if self.search_type == SearchType.vector:
+            return await self.async_vector_search(query=query, limit=limit, filters=filters)
+        elif self.search_type == SearchType.keyword:
+            return await self.async_keyword_search(query=query, limit=limit, filters=filters)
+        elif self.search_type == SearchType.hybrid:
+            return await self.async_hybrid_search(query=query, limit=limit, filters=filters)
+        else:
+            logger.error(f"Invalid search type '{self.search_type}'.")
+            return []
+
+    async def async_vector_search(self, query: str, limit: int = 5, filters: Optional[Dict[str, Any]] = None) -> List[Document]:
+        """
+        Perform a vector similarity search asynchronously.
+
+        Args:
+            query (str): The search query.
+            limit (int): Maximum number of results to return.
+            filters (Optional[Dict[str, Any]]): Filters to apply to the search.
+
+        Returns:
+            List[Document]: List of matching documents.
+        """
+        try:
+            # Get the embedding for the query string
+            query_embedding = self.embedder.get_embedding(query)
+            if query_embedding is None:
+                logger.error(f"Error getting embedding for Query: {query}")
+                return []
+
+            # Define the columns to select
+            columns = [
+                self.table.c.id,
+                self.table.c.name,
+                self.table.c.meta_data,
+                self.table.c.content,
+                self.table.c.embedding,
+                self.table.c.usage,
+            ]
+
+            # Build the base statement
+            stmt = select(*columns)
+
+            # Apply filters if provided
+            if filters is not None:
+                stmt = stmt.where(self.table.c.filters.contains(filters))
+
+            # Order the results based on the distance metric
+            if self.distance == Distance.l2:
+                stmt = stmt.order_by(self.table.c.embedding.l2_distance(query_embedding))
+            elif self.distance == Distance.cosine:
+                stmt = stmt.order_by(self.table.c.embedding.cosine_distance(query_embedding))
+            elif self.distance == Distance.max_inner_product:
+                stmt = stmt.order_by(self.table.c.embedding.max_inner_product(query_embedding))
+            else:
+                logger.error(f"Unknown distance metric: {self.distance}")
+                return []
+
+            # Limit the number of results
+            stmt = stmt.limit(limit)
+
+            # Log the query for debugging
+            log_debug(f"Vector search query: {stmt}")
+
+            # Execute the query
+            try:
+                async with self.AsyncSession() as async_sess:
+                    async with async_sess.begin():
+                        if self.vector_index is not None:
+                            if isinstance(self.vector_index, Ivfflat):
+                                await async_sess.execute(text(f"SET LOCAL ivfflat.probes = {self.vector_index.probes}"))
+                            elif isinstance(self.vector_index, HNSW):
+                                await async_sess.execute(text(f"SET LOCAL hnsw.ef_search = {self.vector_index.ef_search}"))
+                        result = await async_sess.execute(stmt)
+                        results = await result.fetchall()
+            except Exception as e:
+                logger.error(f"Error performing semantic search: {e}")
+                logger.error("Table might not exist, creating for future use")
+                await self.async_create()
+                return []
+
+            # Process the results and convert to Document objects
+            search_results: List[Document] = []
+            for result in results:
+                search_results.append(
+                    Document(
+                        id=result.id,
+                        name=result.name,
+                        meta_data=result.meta_data,
+                        content=result.content,
+                        embedder=self.embedder,
+                        embedding=result.embedding,
+                        usage=result.usage,
+                    )
+                )
+
+            if self.reranker:
+                search_results = self.reranker.rerank(query=query, documents=search_results)
+
+            return search_results
+        except Exception as e:
+            logger.error(f"Error during vector search: {e}")
+            return []
+
+    async def async_keyword_search(self, query: str, limit: int = 5, filters: Optional[Dict[str, Any]] = None) -> List[Document]:
+        """
+        Perform a keyword search on the 'content' column asynchronously.
+
+        Args:
+            query (str): The search query.
+            limit (int): Maximum number of results to return.
+            filters (Optional[Dict[str, Any]]): Filters to apply to the search.
+
+        Returns:
+            List[Document]: List of matching documents.
+        """
+        try:
+            # Define the columns to select
+            columns = [
+                self.table.c.id,
+                self.table.c.name,
+                self.table.c.meta_data,
+                self.table.c.content,
+                self.table.c.embedding,
+                self.table.c.usage,
+            ]
+
+            # Build the base statement
+            stmt = select(*columns)
+
+            # Build the text search vector
+            ts_vector = func.to_tsvector(self.content_language, self.table.c.content)
+            # Create the ts_query using websearch_to_tsquery with parameter binding
+            processed_query = self.enable_prefix_matching(query) if self.prefix_match else query
+            ts_query = func.websearch_to_tsquery(self.content_language, bindparam("query", value=processed_query))
+            # Compute the text rank
+            text_rank = func.ts_rank_cd(ts_vector, ts_query)
+
+            # Apply filters if provided
+            if filters is not None:
+                stmt = stmt.where(self.table.c.filters.contains(filters))
+
+            # Order by the relevance rank
+            stmt = stmt.order_by(text_rank.desc())
+
+            # Limit the number of results
+            stmt = stmt.limit(limit)
+
+            # Log the query for debugging
+            log_debug(f"Keyword search query: {stmt}")
+
+            # Execute the query
+            try:
+                async with self.AsyncSession() as async_sess:
+                    async with async_sess.begin():
+                        result = await async_sess.execute(stmt)
+                        results = await result.fetchall()
+            except Exception as e:
+                logger.error(f"Error performing keyword search: {e}")
+                logger.error("Table might not exist, creating for future use")
+                await self.async_create()
+                return []
+
+            # Process the results and convert to Document objects
+            search_results: List[Document] = []
+            for result in results:
+                search_results.append(
+                    Document(
+                        id=result.id,
+                        name=result.name,
+                        meta_data=result.meta_data,
+                        content=result.content,
+                        embedder=self.embedder,
+                        embedding=result.embedding,
+                        usage=result.usage,
+                    )
+                )
+
+            return search_results
+        except Exception as e:
+            logger.error(f"Error during keyword search: {e}")
+            return []
+
+    async def async_hybrid_search(
+        self,
+        query: str,
+        limit: int = 5,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> List[Document]:
+        """
+        Perform a hybrid search combining vector similarity and full-text search asynchronously.
+
+        Args:
+            query (str): The search query.
+            limit (int): Maximum number of results to return.
+            filters (Optional[Dict[str, Any]]): Filters to apply to the search.
+
+        Returns:
+            List[Document]: List of matching documents.
+        """
+        try:
+            # Get the embedding for the query string
+            query_embedding = self.embedder.get_embedding(query)
+            if query_embedding is None:
+                logger.error(f"Error getting embedding for Query: {query}")
+                return []
+
+            # Define the columns to select
+            columns = [
+                self.table.c.id,
+                self.table.c.name,
+                self.table.c.meta_data,
+                self.table.c.content,
+                self.table.c.embedding,
+                self.table.c.usage,
+            ]
+
+            # Build the text search vector
+            ts_vector = func.to_tsvector(self.content_language, self.table.c.content)
+            # Create the ts_query using websearch_to_tsquery with parameter binding
+            processed_query = self.enable_prefix_matching(query) if self.prefix_match else query
+            ts_query = func.websearch_to_tsquery(self.content_language, bindparam("query", value=processed_query))
+            # Compute the text rank
+            text_rank = func.ts_rank_cd(ts_vector, ts_query)
+
+            # Compute the vector similarity score
+            if self.distance == Distance.l2:
+                # For L2 distance, smaller distances are better
+                vector_distance = self.table.c.embedding.l2_distance(query_embedding)
+                # Invert and normalize the distance to get a similarity score between 0 and 1
+                vector_score = 1 / (1 + vector_distance)
+            elif self.distance == Distance.cosine:
+                # For cosine distance, smaller distances are better
+                vector_distance = self.table.c.embedding.cosine_distance(query_embedding)
+                vector_score = 1 / (1 + vector_distance)
+            elif self.distance == Distance.max_inner_product:
+                # For inner product, higher values are better
+                # Assume embeddings are normalized, so inner product ranges from -1 to 1
+                raw_vector_score = self.table.c.embedding.max_inner_product(query_embedding)
+                # Normalize to range [0, 1]
+                vector_score = (raw_vector_score + 1) / 2
+            else:
+                logger.error(f"Unknown distance metric: {self.distance}")
+                return []
+
+            # Apply weights to control the influence of each score
+            # Validate the vector_weight parameter
+            if not 0 <= self.vector_score_weight <= 1:
+                raise ValueError("vector_score_weight must be between 0 and 1")
+            text_rank_weight = 1 - self.vector_score_weight  # weight for text rank
+
+            # Combine the scores into a hybrid score
+            hybrid_score = (self.vector_score_weight * vector_score) + (text_rank_weight * text_rank)
+
+            # Build the base statement, including the hybrid score
+            stmt = select(*columns, hybrid_score.label("hybrid_score"))
+
+            # Apply filters if provided
+            if filters is not None:
+                stmt = stmt.where(self.table.c.filters.contains(filters))
+
+            # Order the results by the hybrid score in descending order
+            stmt = stmt.order_by(desc("hybrid_score"))
+
+            # Limit the number of results
+            stmt = stmt.limit(limit)
+
+            # Log the query for debugging
+            log_debug(f"Hybrid search query: {stmt}")
+
+            # Execute the query
+            try:
+                async with self.AsyncSession() as async_sess:
+                    async with async_sess.begin():
+                        if self.vector_index is not None:
+                            if isinstance(self.vector_index, Ivfflat):
+                                await async_sess.execute(text(f"SET LOCAL ivfflat.probes = {self.vector_index.probes}"))
+                            elif isinstance(self.vector_index, HNSW):
+                                await async_sess.execute(text(f"SET LOCAL hnsw.ef_search = {self.vector_index.ef_search}"))
+                        result = await async_sess.execute(stmt)
+                        results = await result.fetchall()
+            except Exception as e:
+                logger.error(f"Error performing hybrid search: {e}")
+                return []
+
+            # Process the results and convert to Document objects
+            search_results: List[Document] = []
+            for result in results:
+                search_results.append(
+                    Document(
+                        id=result.id,
+                        name=result.name,
+                        meta_data=result.meta_data,
+                        content=result.content,
+                        embedder=self.embedder,
+                        embedding=result.embedding,
+                        usage=result.usage,
+                    )
+                )
+
+            return search_results
+        except Exception as e:
+            logger.error(f"Error during hybrid search: {e}")
+            return []
 
     async def async_drop(self) -> None:
-        raise NotImplementedError(f"Async not supported on {self.__class__.__name__}.")
+        """
+        Drop the table from the database asynchronously.
+        """
+        if await self.async_table_exists():
+            try:
+                log_debug(f"Dropping table '{self.table.fullname}'.")
+                async with self.AsyncSession() as async_sess:
+                    async with async_sess.begin():
+                        await async_sess.run_sync(self.table.drop)
+                log_info(f"Table '{self.table.fullname}' dropped successfully.")
+            except Exception as e:
+                logger.error(f"Error dropping table '{self.table.fullname}': {e}")
+                raise
+        else:
+            log_info(f"Table '{self.table.fullname}' does not exist.")
 
     async def async_exists(self) -> bool:
-        raise NotImplementedError(f"Async not supported on {self.__class__.__name__}.")
+        """
+        Check if the table exists in the database asynchronously.
+
+        Returns:
+            bool: True if the table exists, False otherwise.
+        """
+        return await self.async_table_exists()
+
+    async def async_table_exists(self) -> bool:
+        """
+        Check if the table exists in the database asynchronously.
+
+        Returns:
+            bool: True if the table exists, False otherwise.
+        """
+        log_debug(f"Checking if table '{self.table.fullname}' exists.")
+        try:
+            async with self.AsyncSession() as async_sess:
+                async with async_sess.begin():
+                    return await async_sess.run_sync(lambda conn: inspect(conn).has_table(self.table_name, schema=self.schema))
+        except Exception as e:
+            logger.error(f"Error checking if table exists: {e}")
+            return False
+
+    async def _async_record_exists(self, column, value) -> bool:
+        """
+        Check if a record with the given column value exists in the table asynchronously.
+
+        Args:
+            column: The column to check.
+            value: The value to search for.
+
+        Returns:
+            bool: True if the record exists, False otherwise.
+        """
+        try:
+            async with self.AsyncSession() as async_sess:
+                async with async_sess.begin():
+                    stmt = select(1).where(column == value).limit(1)
+                    result = await async_sess.execute(stmt)
+                    return result.first() is not None
+        except Exception as e:
+            logger.error(f"Error checking if record exists: {e}")
+            return False
 
     async def async_name_exists(self, name: str) -> bool:
-        raise NotImplementedError(f"Async not supported on {self.__class__.__name__}.")
+        """
+        Check if a document with the given name exists in the table asynchronously.
+
+        Args:
+            name (str): The name to check.
+
+        Returns:
+            bool: True if a document with the name exists, False otherwise.
+        """
+        return await self._async_record_exists(self.table.c.name, name)
+
+    async def async_get_count(self) -> int:
+        """
+        Get the number of records in the table asynchronously.
+
+        Returns:
+            int: The number of records in the table.
+        """
+        try:
+            async with self.AsyncSession() as async_sess:
+                async with async_sess.begin():
+                    stmt = select(func.count(self.table.c.name)).select_from(self.table)
+                    result = await async_sess.execute(stmt)
+                    scalar_result = await result.scalar()
+                    return int(scalar_result) if scalar_result is not None else 0
+        except Exception as e:
+            logger.error(f"Error getting count from table '{self.table.fullname}': {e}")
+            return 0
