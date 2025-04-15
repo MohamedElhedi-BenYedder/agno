@@ -1,6 +1,6 @@
 from hashlib import md5
 from math import sqrt
-from typing import Any, Dict, List, Optional, Union, cast
+from typing import Any, Callable, Dict, List, Optional, Union, cast
 
 try:
     from sqlalchemy.dialects import postgresql
@@ -53,6 +53,7 @@ class PgVector(VectorDb):
         search_type: SearchType = SearchType.vector,
         vector_index: Union[Ivfflat, HNSW] = HNSW(),
         distance: Distance = Distance.cosine,
+        scopefunc: Callable | None = None,
         prefix_match: bool = False,
         vector_score_weight: float = 0.5,
         content_language: str = "english",
@@ -72,6 +73,7 @@ class PgVector(VectorDb):
             search_type (SearchType): Type of search to perform.
             vector_index (Union[Ivfflat, HNSW]): Vector index configuration.
             distance (Distance): Distance metric for vector comparisons.
+            scopefunc (Callable | None): Scope function for the db session.
             prefix_match (bool): Enable prefix matching for full-text search.
             vector_score_weight (float): Weight for vector similarity in hybrid search.
             content_language (str): Language for full-text search.
@@ -81,38 +83,43 @@ class PgVector(VectorDb):
         if not table_name:
             raise ValueError("Table name must be provided.")
 
-        url = db_url or async_engine.url if async_engine else None or db_engine.url if db_engine else None
+        url = db_url or (async_engine.url if async_engine else None) or (db_engine.url if db_engine else None)
         if url is None:
             raise ValueError("Either 'db_url' or 'db_engine' or 'async_engine' must be provided.")
 
-        
         multi_host_url = MultiHostUrl(url)
+        host = multi_host_url.hosts()[0]
+        url_dict = {
+            "path": multi_host_url.path[1:],
+            "query": multi_host_url.query,
+            "fragment": multi_host_url.fragment,
+            "password": host["password"],
+            "username": host["username"],
+            "host": host["host"],
+            "port": host["port"],
+        }
         
-        if db_engine is None:
-            try:
-                sync_db_url = MultiHostUrl.build(
-                scheme="postgresql+psycopg",
-                path=multi_host_url.path,
-                query=multi_host_url.query,
-                fragment=multi_host_url.fragment,
-            )
-                self.db_engine = create_engine(sync_db_url)
-            except Exception as e:
-                logger.error(f"Failed to create engine from 'db_url': {e}")
-                raise
+
             
-        if async_engine is None:
+        if async_engine is None and url is not None:
             try:
-                async_db_url = MultiHostUrl.build(
+                async_db_url = str(MultiHostUrl.build(
                 scheme="postgresql+asyncpg",
-                path=multi_host_url.path,
-                query=multi_host_url.query,
-                fragment=multi_host_url.fragment,
-            )
+                **url_dict
+            ))
+                logger.info(f"Async DB URL: {async_db_url}")
                 self.async_engine = create_async_engine(async_db_url)
             except Exception as e:
                 logger.error(f"Failed to create engine from 'db_url': {e}")
                 raise 
+        else:
+            self.async_engine = async_engine
+            
+            
+        if db_engine is None and async_engine is not None:
+            self.db_engine =  self.async_engine.sync_engine
+        else:
+            self.db_engine = db_engine
         # Database settings 
         self.table_name: str = table_name
         self.schema: str = schema
@@ -153,12 +160,24 @@ class PgVector(VectorDb):
         self.reranker: Optional[Reranker] = reranker
 
         # Database session
-        self.Session: scoped_session = scoped_session(sessionmaker(bind=self.db_engine))
-        self.AsyncSession: async_scoped_session = async_scoped_session(async_sessionmaker(bind=self.async_engine))
+        self.Session: scoped_session  = scoped_session(sessionmaker(bind=self.db_engine), scopefunc=scopefunc)
+        self.AsyncSession: async_scoped_session | async_sessionmaker = async_scoped_session(async_sessionmaker(bind=self.async_engine), scopefunc=scopefunc)  if scopefunc else async_sessionmaker(bind=self.async_engine)
         # Database table
         self.table: Table = self.get_table()
         log_debug(f"Initialized PgVector with table '{self.schema}.{self.table_name}'")
 
+    def _session(self, session:Session | None = None):
+        if session:
+            return session
+        return self.Session()
+       
+
+    def _async_session(self, async_session:AsyncSession | None = None):
+        if async_session:
+            return async_session
+        return self.AsyncSession()
+       
+    
     def get_table_v1(self) -> Table:
         """
         Get the SQLAlchemy Table object for schema version 1.
@@ -217,12 +236,12 @@ class PgVector(VectorDb):
             logger.error(f"Error checking if table exists: {e}")
             return False
 
-    def create(self) -> None:
+    def create(self, session:Session | None = None) -> None:
         """
         Create the table if it does not exist.
         """
         if not self.table_exists():
-            with self.Session() as sess, sess.begin():
+            with self._session(session) as sess, sess.begin():
                 log_debug("Creating extension: vector")
                 sess.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
                 if self.schema is not None:
@@ -231,7 +250,7 @@ class PgVector(VectorDb):
             log_debug(f"Creating table: {self.table_name}")
             self.table.create(self.db_engine)
 
-    def _record_exists(self, column, value) -> bool:
+    def _record_exists(self, column, value, session:Session | None = None) -> bool:
         """
         Check if a record with the given column value exists in the table.
 
@@ -243,7 +262,7 @@ class PgVector(VectorDb):
             bool: True if the record exists, False otherwise.
         """
         try:
-            with self.Session() as sess, sess.begin():
+            with self._session(session) as sess, sess.begin():
                 stmt = select(1).where(column == value).limit(1)
                 result = sess.execute(stmt).first()
                 return result is not None
@@ -251,7 +270,7 @@ class PgVector(VectorDb):
             logger.error(f"Error checking if record exists: {e}")
             return False
 
-    def doc_exists(self, document: Document) -> bool:
+    def doc_exists(self, document: Document, session:Session | None = None) -> bool:
         """
         Check if a document with the same content hash exists in the table.
 
@@ -263,9 +282,9 @@ class PgVector(VectorDb):
         """
         cleaned_content = document.content.replace("\x00", "\ufffd")
         content_hash = md5(cleaned_content.encode()).hexdigest()
-        return self._record_exists(self.table.c.content_hash, content_hash)
+        return self._record_exists(self.table.c.content_hash, content_hash, session)
 
-    def name_exists(self, name: str) -> bool:
+    def name_exists(self, name: str, session:Session | None = None) -> bool:
         """
         Check if a document with the given name exists in the table.
 
@@ -275,9 +294,9 @@ class PgVector(VectorDb):
         Returns:
             bool: True if a document with the name exists, False otherwise.
         """
-        return self._record_exists(self.table.c.name, name)
+        return self._record_exists(self.table.c.name, name, session)
 
-    def id_exists(self, id: str) -> bool:
+    def id_exists(self, id: str, session:Session | None = None) -> bool:
         """
         Check if a document with the given ID exists in the table.
 
@@ -287,7 +306,7 @@ class PgVector(VectorDb):
         Returns:
             bool: True if a document with the ID exists, False otherwise.
         """
-        return self._record_exists(self.table.c.id, id)
+        return self._record_exists(self.table.c.id, id, session)
 
     def _clean_content(self, content: str) -> str:
         """
@@ -306,6 +325,7 @@ class PgVector(VectorDb):
         documents: List[Document],
         filters: Optional[Dict[str, Any]] = None,
         batch_size: int = 100,
+        session:Session | None = None
     ) -> None:
         """
         Insert documents into the database.
@@ -316,7 +336,7 @@ class PgVector(VectorDb):
             batch_size (int): Number of documents to insert in each batch.
         """
         try:
-            with self.Session() as sess:
+            with self._session(session) as sess:
                 for i in range(0, len(documents), batch_size):
                     batch_docs = documents[i : i + batch_size]
                     log_debug(f"Processing batch starting at index {i}, size: {len(batch_docs)}")
@@ -370,6 +390,7 @@ class PgVector(VectorDb):
         documents: List[Document],
         filters: Optional[Dict[str, Any]] = None,
         batch_size: int = 100,
+        session:Session | None = None
     ) -> None:
         """
         Upsert (insert or update) documents in the database.
@@ -380,7 +401,7 @@ class PgVector(VectorDb):
             batch_size (int): Number of documents to upsert in each batch.
         """
         try:
-            with self.Session() as sess:
+            with self._session(session) as sess:
                 for i in range(0, len(documents), batch_size):
                     batch_docs = documents[i : i + batch_size]
                     log_debug(f"Processing batch starting at index {i}, size: {len(batch_docs)}")
@@ -432,7 +453,7 @@ class PgVector(VectorDb):
             logger.error(f"Error upserting documents: {e}")
             raise
 
-    def search(self, query: str, limit: int = 5, filters: Optional[Dict[str, Any]] = None) -> List[Document]:
+    def search(self, query: str, limit: int = 5, filters: Optional[Dict[str, Any]] = None, session:Session | None = None) -> List[Document]:
         """
         Perform a search based on the configured search type.
 
@@ -445,16 +466,16 @@ class PgVector(VectorDb):
             List[Document]: List of matching documents.
         """
         if self.search_type == SearchType.vector:
-            return self.vector_search(query=query, limit=limit, filters=filters)
+            return self.vector_search(query=query, limit=limit, filters=filters, session=session)
         elif self.search_type == SearchType.keyword:
-            return self.keyword_search(query=query, limit=limit, filters=filters)
+            return self.keyword_search(query=query, limit=limit, filters=filters, session=session)
         elif self.search_type == SearchType.hybrid:
-            return self.hybrid_search(query=query, limit=limit, filters=filters)
+            return self.hybrid_search(query=query, limit=limit, filters=filters, session=session)
         else:
             logger.error(f"Invalid search type '{self.search_type}'.")
             return []
 
-    def vector_search(self, query: str, limit: int = 5, filters: Optional[Dict[str, Any]] = None) -> List[Document]:
+    def vector_search(self, query: str, limit: int = 5, filters: Optional[Dict[str, Any]] = None, session:Session | None = None) -> List[Document]:
         """
         Perform a vector similarity search.
 
@@ -509,7 +530,7 @@ class PgVector(VectorDb):
 
             # Execute the query
             try:
-                with self.Session() as sess, sess.begin():
+                with self._session(session) as sess, sess.begin():
                     if self.vector_index is not None:
                         if isinstance(self.vector_index, Ivfflat):
                             sess.execute(text(f"SET LOCAL ivfflat.probes = {self.vector_index.probes}"))
@@ -560,7 +581,7 @@ class PgVector(VectorDb):
         processed_words = [word + "*" for word in words]
         return " ".join(processed_words)
 
-    def keyword_search(self, query: str, limit: int = 5, filters: Optional[Dict[str, Any]] = None) -> List[Document]:
+    def keyword_search(self, query: str, limit: int = 5, filters: Optional[Dict[str, Any]] = None, session:Session | None = None) -> List[Document]:
         """
         Perform a keyword search on the 'content' column.
 
@@ -610,7 +631,7 @@ class PgVector(VectorDb):
 
             # Execute the query
             try:
-                with self.Session() as sess, sess.begin():
+                with self._session(session) as sess, sess.begin():
                     results = sess.execute(stmt).fetchall()
             except Exception as e:
                 logger.error(f"Error performing keyword search: {e}")
@@ -643,6 +664,7 @@ class PgVector(VectorDb):
         query: str,
         limit: int = 5,
         filters: Optional[Dict[str, Any]] = None,
+        session:Session | None = None
     ) -> List[Document]:
         """
         Perform a hybrid search combining vector similarity and full-text search.
@@ -730,7 +752,7 @@ class PgVector(VectorDb):
 
             # Execute the query
             try:
-                with self.Session() as sess, sess.begin():
+                with self._session(session) as sess, sess.begin():
                     if self.vector_index is not None:
                         if isinstance(self.vector_index, Ivfflat):
                             sess.execute(text(f"SET LOCAL ivfflat.probes = {self.vector_index.probes}"))
@@ -785,7 +807,7 @@ class PgVector(VectorDb):
         """
         return self.table_exists()
 
-    def get_count(self) -> int:
+    def get_count(self, session:Session | None = None) -> int:
         """
         Get the number of records in the table.
 
@@ -793,7 +815,7 @@ class PgVector(VectorDb):
             int: The number of records in the table.
         """
         try:
-            with self.Session() as sess, sess.begin():
+            with self._session(session) as sess, sess.begin():
                 stmt = select(func.count(self.table.c.name)).select_from(self.table)
                 result = sess.execute(stmt).scalar()
                 return int(result) if result is not None else 0
@@ -801,7 +823,7 @@ class PgVector(VectorDb):
             logger.error(f"Error getting count from table '{self.table.fullname}': {e}")
             return 0
 
-    def optimize(self, force_recreate: bool = False) -> None:
+    def optimize(self, force_recreate: bool = False, session:Session | None = None) -> None:
         """
         Optimize the vector database by creating or recreating necessary indexes.
 
@@ -827,7 +849,7 @@ class PgVector(VectorDb):
         indexes = inspector.get_indexes(self.table.name, schema=self.schema)
         return any(idx["name"] == index_name for idx in indexes)
 
-    def _drop_index(self, index_name: str) -> None:
+    def _drop_index(self, index_name: str, session:Session | None = None) -> None:
         """
         Drop the index with the given name.
 
@@ -835,14 +857,14 @@ class PgVector(VectorDb):
             index_name (str): The name of the index to drop.
         """
         try:
-            with self.Session() as sess, sess.begin():
+            with self._session(session) as sess, sess.begin():
                 drop_index_sql = f'DROP INDEX IF EXISTS "{self.schema}"."{index_name}";'
                 sess.execute(text(drop_index_sql))
         except Exception as e:
             logger.error(f"Error dropping index '{index_name}': {e}")
             raise
 
-    def _create_vector_index(self, force_recreate: bool = False) -> None:
+    def _create_vector_index(self, force_recreate: bool = False, session:Session | None = None) -> None:
         """
         Create or recreate the vector index.
 
@@ -882,7 +904,7 @@ class PgVector(VectorDb):
 
         # Proceed to create the vector index
         try:
-            with self.Session() as sess, sess.begin():
+            with self._session(session) as sess, sess.begin():
                 # Set configuration parameters
                 if self.vector_index.configuration:
                     log_debug(f"Setting configuration: {self.vector_index.configuration}")
@@ -965,7 +987,7 @@ class PgVector(VectorDb):
         )
         sess.execute(create_index_sql, {"m": self.vector_index.m, "ef_construction": self.vector_index.ef_construction})
 
-    def _create_gin_index(self, force_recreate: bool = False) -> None:
+    def _create_gin_index(self, force_recreate: bool = False, session:Session | None = None) -> None:
         """
         Create or recreate the GIN index for full-text search.
 
@@ -987,7 +1009,7 @@ class PgVector(VectorDb):
 
         # Proceed to create GIN index
         try:
-            with self.Session() as sess, sess.begin():
+            with self._session(session) as sess, sess.begin():
                 log_debug(f"Creating GIN index '{gin_index_name}' on table '{self.table.fullname}'.")
                 # Create index
                 create_gin_index_sql = text(
@@ -999,7 +1021,7 @@ class PgVector(VectorDb):
             logger.error(f"Error creating GIN index '{gin_index_name}': {e}")
             raise
 
-    def delete(self) -> bool:
+    def delete(self, session:Session | None = None) -> bool:
         """
         Delete all records from the table.
 
@@ -1009,7 +1031,7 @@ class PgVector(VectorDb):
         from sqlalchemy import delete
 
         try:
-            with self.Session() as sess:
+            with self._session(session) as sess:
                 sess.execute(delete(self.table))
                 sess.commit()
                 log_info(f"Deleted all records from table '{self.table.fullname}'.")
@@ -1052,12 +1074,12 @@ class PgVector(VectorDb):
 
         return copied_obj
 
-    async def async_create(self) -> None:
+    async def async_create(self, async_session:AsyncSession | None = None) -> None:
         """
         Create the table if it does not exist asynchronously.
         """
         if not await self.async_table_exists():
-            async with self.AsyncSession() as async_sess:
+            async with self._async_session(async_session) as async_sess:
                 async with async_sess.begin():
                     log_debug("Creating extension: vector")
                     await async_sess.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
@@ -1065,11 +1087,11 @@ class PgVector(VectorDb):
                         log_debug(f"Creating schema: {self.schema}")
                         await async_sess.execute(text(f"CREATE SCHEMA IF NOT EXISTS {self.schema};"))
             log_debug(f"Creating table: {self.table_name}")
-            async with self.AsyncSession() as async_sess:
+            async with self._async_session() as async_sess:
                 async with async_sess.begin():
                     await async_sess.run_sync(self.table.create)
 
-    async def async_doc_exists(self, document: Document) -> bool:
+    async def async_doc_exists(self, document: Document, async_session:AsyncSession | None = None) -> bool:
         """
         Check if a document with the same content hash exists in the table asynchronously.
 
@@ -1081,13 +1103,14 @@ class PgVector(VectorDb):
         """
         cleaned_content = document.content.replace("\x00", "\ufffd")
         content_hash = md5(cleaned_content.encode()).hexdigest()
-        return await self._async_record_exists(self.table.c.content_hash, content_hash)
+        return await self._async_record_exists(self.table.c.content_hash, content_hash, async_session)
 
     async def async_insert(
         self,
         documents: List[Document],
         filters: Optional[Dict[str, Any]] = None,
         batch_size: int = 100,
+        async_session:AsyncSession | None = None
     ) -> None:
         """
         Insert documents into the database asynchronously.
@@ -1098,7 +1121,7 @@ class PgVector(VectorDb):
             batch_size (int): Number of documents to insert in each batch.
         """
         try:
-            async with self.AsyncSession() as async_sess:
+            async with self._async_session(async_session) as async_sess:
                 for i in range(0, len(documents), batch_size):
                     batch_docs = documents[i : i + batch_size]
                     log_debug(f"Processing batch starting at index {i}, size: {len(batch_docs)}")
@@ -1142,6 +1165,7 @@ class PgVector(VectorDb):
         documents: List[Document],
         filters: Optional[Dict[str, Any]] = None,
         batch_size: int = 100,
+        async_session:AsyncSession | None = None
     ) -> None:
         """
         Upsert (insert or update) documents in the database asynchronously.
@@ -1152,7 +1176,7 @@ class PgVector(VectorDb):
             batch_size (int): Number of documents to upsert in each batch.
         """
         try:
-            async with self.AsyncSession() as async_sess:
+            async with self._async_session(async_session) as async_sess:
                 for i in range(0, len(documents), batch_size):
                     batch_docs = documents[i : i + batch_size]
                     log_debug(f"Processing batch starting at index {i}, size: {len(batch_docs)}")
@@ -1204,7 +1228,7 @@ class PgVector(VectorDb):
             raise
 
     async def async_search(
-        self, query: str, limit: int = 5, filters: Optional[Dict[str, Any]] = None
+        self, query: str, limit: int = 5, filters: Optional[Dict[str, Any]] = None, async_session:AsyncSession | None = None
     ) -> List[Document]:
         """
         Perform a search based on the configured search type asynchronously.
@@ -1227,7 +1251,7 @@ class PgVector(VectorDb):
             logger.error(f"Invalid search type '{self.search_type}'.")
             return []
 
-    async def async_vector_search(self, query: str, limit: int = 5, filters: Optional[Dict[str, Any]] = None) -> List[Document]:
+    async def async_vector_search(self, query: str, limit: int = 5, filters: Optional[Dict[str, Any]] = None, async_session:AsyncSession | None = None) -> List[Document]:
         """
         Perform a vector similarity search asynchronously.
 
@@ -1282,7 +1306,7 @@ class PgVector(VectorDb):
 
             # Execute the query
             try:
-                async with self.AsyncSession() as async_sess:
+                async with self._async_session(async_session) as async_sess:
                     async with async_sess.begin():
                         if self.vector_index is not None:
                             if isinstance(self.vector_index, Ivfflat):
@@ -1320,7 +1344,7 @@ class PgVector(VectorDb):
             logger.error(f"Error during vector search: {e}")
             return []
 
-    async def async_keyword_search(self, query: str, limit: int = 5, filters: Optional[Dict[str, Any]] = None) -> List[Document]:
+    async def async_keyword_search(self, query: str, limit: int = 5, filters: Optional[Dict[str, Any]] = None, async_session:AsyncSession | None = None) -> List[Document]:
         """
         Perform a keyword search on the 'content' column asynchronously.
 
@@ -1369,7 +1393,7 @@ class PgVector(VectorDb):
 
             # Execute the query
             try:
-                async with self.AsyncSession() as async_sess:
+                async with self._async_session(async_session) as async_sess:
                     async with async_sess.begin():
                         result = await async_sess.execute(stmt)
                         results = await result.fetchall()
@@ -1404,6 +1428,7 @@ class PgVector(VectorDb):
         query: str,
         limit: int = 5,
         filters: Optional[Dict[str, Any]] = None,
+        async_session:AsyncSession | None = None
     ) -> List[Document]:
         """
         Perform a hybrid search combining vector similarity and full-text search asynchronously.
@@ -1488,7 +1513,7 @@ class PgVector(VectorDb):
 
             # Execute the query
             try:
-                async with self.AsyncSession() as async_sess:
+                async with self._async_session(async_session) as async_sess:
                     async with async_sess.begin():
                         if self.vector_index is not None:
                             if isinstance(self.vector_index, Ivfflat):
@@ -1521,14 +1546,14 @@ class PgVector(VectorDb):
             logger.error(f"Error during hybrid search: {e}")
             return []
 
-    async def async_drop(self) -> None:
+    async def async_drop(self, async_session:AsyncSession | None = None) -> None:
         """
         Drop the table from the database asynchronously.
         """
         if await self.async_table_exists():
             try:
                 log_debug(f"Dropping table '{self.table.fullname}'.")
-                async with self.AsyncSession() as async_sess:
+                async with self._async_session(async_session) as async_sess:
                     async with async_sess.begin():
                         await async_sess.run_sync(self.table.drop)
                 log_info(f"Table '{self.table.fullname}' dropped successfully.")
@@ -1538,7 +1563,7 @@ class PgVector(VectorDb):
         else:
             log_info(f"Table '{self.table.fullname}' does not exist.")
 
-    async def async_exists(self) -> bool:
+    async def async_exists(self, async_session:AsyncSession | None = None) -> bool:
         """
         Check if the table exists in the database asynchronously.
 
@@ -1547,7 +1572,7 @@ class PgVector(VectorDb):
         """
         return await self.async_table_exists()
 
-    async def async_table_exists(self) -> bool:
+    async def async_table_exists(self, async_session:AsyncSession | None = None) -> bool:
         """
         Check if the table exists in the database asynchronously.
 
@@ -1556,14 +1581,14 @@ class PgVector(VectorDb):
         """
         log_debug(f"Checking if table '{self.table.fullname}' exists.")
         try:
-            async with self.AsyncSession() as async_sess:
+            async with self._async_session(async_session) as async_sess:
                 async with async_sess.begin():
                     return await async_sess.run_sync(lambda conn: inspect(conn).has_table(self.table_name, schema=self.schema))
         except Exception as e:
             logger.error(f"Error checking if table exists: {e}")
             return False
 
-    async def _async_record_exists(self, column, value) -> bool:
+    async def _async_record_exists(self, column, value, async_session:AsyncSession | None = None) -> bool:
         """
         Check if a record with the given column value exists in the table asynchronously.
 
@@ -1575,7 +1600,7 @@ class PgVector(VectorDb):
             bool: True if the record exists, False otherwise.
         """
         try:
-            async with self.AsyncSession() as async_sess:
+            async with self._async_session(async_session) as async_sess:
                 async with async_sess.begin():
                     stmt = select(1).where(column == value).limit(1)
                     result = await async_sess.execute(stmt)
@@ -1584,7 +1609,7 @@ class PgVector(VectorDb):
             logger.error(f"Error checking if record exists: {e}")
             return False
 
-    async def async_name_exists(self, name: str) -> bool:
+    async def async_name_exists(self, name: str, async_session:AsyncSession | None = None) -> bool:
         """
         Check if a document with the given name exists in the table asynchronously.
 
@@ -1594,9 +1619,9 @@ class PgVector(VectorDb):
         Returns:
             bool: True if a document with the name exists, False otherwise.
         """
-        return await self._async_record_exists(self.table.c.name, name)
+        return await self._async_record_exists(self.table.c.name, name, async_session)
 
-    async def async_get_count(self) -> int:
+    async def async_get_count(self, async_session:AsyncSession | None = None) -> int:
         """
         Get the number of records in the table asynchronously.
 
@@ -1604,7 +1629,7 @@ class PgVector(VectorDb):
             int: The number of records in the table.
         """
         try:
-            async with self.AsyncSession() as async_sess:
+            async with self._async_session(async_session) as async_sess:
                 async with async_sess.begin():
                     stmt = select(func.count(self.table.c.name)).select_from(self.table)
                     result = await async_sess.execute(stmt)
