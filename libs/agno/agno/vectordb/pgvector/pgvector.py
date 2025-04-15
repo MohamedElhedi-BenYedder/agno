@@ -1,6 +1,6 @@
 from hashlib import md5
 from math import sqrt
-from typing import Any, Callable, Dict, List, Optional, Union, cast
+from typing import Any, Dict, List, Optional, Union, cast, Callable
 
 try:
     from sqlalchemy.dialects import postgresql
@@ -18,11 +18,6 @@ try:
     from pgvector.sqlalchemy import Vector
 except ImportError:
     raise ImportError("`pgvector` not installed. Please install using `pip install pgvector`")
-
-try:
-    from pydantic_core import MultiHostUrl
-except ImportError:
-    raise ImportError("`pydantic_core` not installed. Please install using `pip install pydantic_core`")
 
 from agno.document import Document
 from agno.embedder import Embedder
@@ -87,37 +82,28 @@ class PgVector(VectorDb):
         if url is None:
             raise ValueError("Either 'db_url' or 'db_engine' or 'async_engine' must be provided.")
 
-        multi_host_url = MultiHostUrl(url)
-        host = multi_host_url.hosts()[0]
-        url_dict = {
-            "path": multi_host_url.path[1:],
-            "query": multi_host_url.query,
-            "fragment": multi_host_url.fragment,
-            "password": host["password"],
-            "username": host["username"],
-            "host": host["host"],
-            "port": host["port"],
-        }
+        
         
 
-            
+        _, url = url.split('://', 1)
         if async_engine is None and url is not None:
             try:
-                async_db_url = str(MultiHostUrl.build(
-                scheme="postgresql+asyncpg",
-                **url_dict
-            ))
-                logger.info(f"Async DB URL: {async_db_url}")
+                async_db_url = f"postgresql+asyncpg://{url}"
                 self.async_engine = create_async_engine(async_db_url)
             except Exception as e:
-                logger.error(f"Failed to create engine from 'db_url': {e}")
+                logger.error(f"Failed to create async engine: {e}")
                 raise 
         else:
             self.async_engine = async_engine
             
             
         if db_engine is None and async_engine is not None:
-            self.db_engine =  self.async_engine.sync_engine
+            try:
+                sync_db_url = f"postgresql://{url}"
+                self.db_engine =  create_engine(sync_db_url)
+            except Exception as e:
+                logger.error(f"Failed to create engine: {e}")
+                raise 
         else:
             self.db_engine = db_engine
         # Database settings 
@@ -160,8 +146,10 @@ class PgVector(VectorDb):
         self.reranker: Optional[Reranker] = reranker
 
         # Database session
-        self.Session: scoped_session  = scoped_session(sessionmaker(bind=self.db_engine), scopefunc=scopefunc)
         self.AsyncSession: async_scoped_session | async_sessionmaker = async_scoped_session(async_sessionmaker(bind=self.async_engine), scopefunc=scopefunc)  if scopefunc else async_sessionmaker(bind=self.async_engine)
+
+        self.Session: scoped_session  = scoped_session(sessionmaker(bind=self.db_engine), scopefunc=scopefunc)
+
         # Database table
         self.table: Table = self.get_table()
         log_debug(f"Initialized PgVector with table '{self.schema}.{self.table_name}'")
